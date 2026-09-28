@@ -1,0 +1,29 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    volumes:
+      - ./backend/data:/app/data
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      # Optional extra bind (e.g. a Tailscale IP). Defaults to localhost only so no
+      # private address is committed. Set MEHL_BIND_IP in .env to enable.
+      - "${MEHL_BIND_IP:-127.0.0.1}:8000:80"
+    depends_on:
+      backend:
+        condition: service_healthy

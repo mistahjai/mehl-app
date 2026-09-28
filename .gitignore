@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/dev-dist/
+
+# Local data (market.duckdb, mehl.db, parquet drops)
+backend/data/*
+!backend/data/.gitkeep
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Logs & scratch
+*.log
+tmp/
+uploads/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+MEMORY.md
