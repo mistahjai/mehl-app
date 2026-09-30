@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     # trigger time would otherwise skip the day. Turn this off where starting the
     # app must not kick off a real ingest (tests, one-off tooling).
     data_update_catchup_enabled: bool = True
+    # Path to the APScheduler job store (SQLite). Survives container restarts.
+    data_update_jobstore_path: Path = Path(__file__).resolve().parent.parent / "data" / "scheduler.sqlite"
 
     @property
     def effective_database_url(self) -> str:

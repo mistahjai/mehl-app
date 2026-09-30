@@ -220,14 +220,21 @@ def _run_scheme_audit() -> dict:
     return report
 
 
-def run_data_update(bhavcopy_days: int = BHAVCOPY_DAYS, rate: float = 0.5) -> dict:
+def run_data_update(bhavcopy_days: int = BHAVCOPY_DAYS, rate: float = 0.5, trigger: str = "manual") -> dict:
     """Pull new data from every source and refresh derived caches.
 
     Steps run in order; a failing source (e.g. NSE blocked) is logged and
     skipped. Returns a status dict persisted in the Setting table.
+
+    Args:
+        bhavcopy_days: Look-back window for bhavcopy ingest.
+        rate: Minimum seconds between requests.
+        trigger: Source of the run - "scheduled", "manual", "catchup", or "watchdog".
     """
+    logger.info("data update started (trigger=%s)", trigger)
     if not _lock.acquire(blocking=False):
         return {"status": "already_running", "last_run": read_status()}
+    
     started = time.monotonic()
     steps: dict[str, Any] = {}
     durations: dict[str, float] = {}
@@ -244,66 +251,82 @@ def run_data_update(bhavcopy_days: int = BHAVCOPY_DAYS, rate: float = 0.5) -> di
             logger.warning("data update: %s failed: %s", name, e)
         durations[name] = round(time.monotonic() - began, 1)
 
-    from app.ingest import actions as actions_mod
-    from app.ingest import amfi, bhavcopy, indices as indices_mod
+    try:
+        from app.ingest import actions as actions_mod
+        from app.ingest import amfi, bhavcopy, indices as indices_mod
 
-    step("bhavcopy", lambda: bhavcopy.ingest_bhavcopy(start, end, rate=rate))
-    step("actions", lambda: actions_mod.ingest_actions(start, end, rate=rate))
-    step("indices", lambda: indices_mod.ingest_indices(start, end))
-    # Runs before navs on purpose: the portal ingest is filtered by the
-    # securities master, so a scheme registered here gets its NAV rows in this
-    # same run instead of waiting a day.
-    step("scheme_sync", lambda: amfi.sync_schemes_from_portal())
-    step("scheme_audit", _run_scheme_audit)
-    # The ladder result is kept whole. Collapsing it to `["rows"]` meant a total
-    # failure still recorded a number, so the run reported "ok" while the source
-    # ladder had exhausted every fallback.
-    step("navs", lambda: amfi.ingest_nav_latest())
-    if not steps.get("navs", {}).get("ok"):
-        errors.append(
-            f"navs: no source produced NAVs ({steps.get('navs', {}).get('errors')})"
-        )
+        step("bhavcopy", lambda: bhavcopy.ingest_bhavcopy(start, end, rate=rate))
+        step("actions", lambda: actions_mod.ingest_actions(start, end, rate=rate))
+        step("indices", lambda: indices_mod.ingest_indices(start, end))
+        # Runs before navs on purpose: the portal ingest is filtered by the
+        # securities master, so a scheme registered here gets its NAV rows in this
+        # same run instead of waiting a day.
+        step("scheme_sync", lambda: amfi.sync_schemes_from_portal())
+        step("scheme_audit", _run_scheme_audit)
+        # The ladder result is kept whole. Collapsing it to `["rows"]` meant a total
+        # failure still recorded a number, so the run reported "ok" while the source
+        # ladder had exhausted every fallback.
+        step("navs", lambda: amfi.ingest_nav_latest())
+        if not steps.get("navs", {}).get("ok"):
+            errors.append(
+                f"navs: no source produced NAVs ({steps.get('navs', {}).get('errors')})"
+            )
 
-    warnings: list[str] = []
-    audit = steps.get("scheme_audit")
-    if isinstance(audit, dict) and audit.get("unknown"):
-        msg = (
-            f"mfapi knows {audit['unknown']} ISINs we do not track (of "
-            f"{audit.get('remote_isins', 0)}); most are dormant. Not imported by design."
-        )
-        warnings.append(msg)
-        logger.info("data update: %s", msg)
+        warnings: list[str] = []
+        audit = steps.get("scheme_audit")
+        if isinstance(audit, dict) and audit.get("unknown"):
+            msg = (
+                f"mfapi knows {audit['unknown']} ISINs we do not track (of "
+                f"{audit.get('remote_isins', 0)}); most are dormant. Not imported by design."
+            )
+            warnings.append(msg)
+            logger.info("data update: %s", msg)
 
-    rows = steps.get("bhavcopy", 0)
-    if isinstance(rows, int) and 0 < rows < BHAVCOPY_MIN_ROWS:
-        msg = (
-            f"bhavcopy only returned {rows} rows for the last {bhavcopy_days} days "
-            f"(expected >= {BHAVCOPY_MIN_ROWS}); NSE likely refused most downloads"
-        )
-        warnings.append(msg)
-        logger.warning("data update: %s", msg)
-        errors.append(msg)
+        rows = steps.get("bhavcopy", 0)
+        if isinstance(rows, int) and 0 < rows < BHAVCOPY_MIN_ROWS:
+            msg = (
+                f"bhavcopy only returned {rows} rows for the last {bhavcopy_days} days "
+                f"(expected >= {BHAVCOPY_MIN_ROWS}); NSE likely refused most downloads"
+            )
+            warnings.append(msg)
+            logger.warning("data update: %s", msg)
+            errors.append(msg)
 
-    freshness = family_freshness()
-    for msg in freshness_warnings(freshness):
-        warnings.append(msg)
-        errors.append(msg)
-        logger.warning("data update: %s", msg)
+        freshness = family_freshness()
+        for msg in freshness_warnings(freshness):
+            warnings.append(msg)
+            errors.append(msg)
+            logger.warning("data update: %s", msg)
 
-    reset_coverage_cache()
+        reset_coverage_cache()
 
-    duration = time.monotonic() - started
-    result = {
-        "status": "ok" if not errors else "partial",
-        "last_run_at": datetime.now(UTC).isoformat(),
-        "duration_s": round(duration, 1),
-        "step_durations_s": durations,
-        "steps": steps,
-        "freshness": freshness,
-        "warnings": warnings,
-        "errors": errors,
-    }
-    _save_status(result)
-    _lock.release()
-    logger.info("data update finished: %s", result)
+        duration = time.monotonic() - started
+        result = {
+            "status": "ok" if not errors else "partial",
+            "trigger": trigger,
+            "last_run_at": datetime.now(UTC).isoformat(),
+            "duration_s": round(duration, 1),
+            "step_durations_s": durations,
+            "steps": steps,
+            "freshness": freshness,
+            "warnings": warnings,
+            "errors": errors,
+        }
+    except Exception as e:
+        logger.exception("data update crashed (trigger=%s): %s", trigger, e)
+        duration = time.monotonic() - started
+        result = {
+            "status": "crashed",
+            "trigger": trigger,
+            "last_run_at": datetime.now(UTC).isoformat(),
+            "duration_s": round(duration, 1),
+            "error": str(e),
+            "steps": steps,
+            "step_durations_s": durations,
+        }
+        raise
+    finally:
+        _save_status(result)
+        _lock.release()
+        logger.info("data update finished (trigger=%s): %s", trigger, result)
     return result
