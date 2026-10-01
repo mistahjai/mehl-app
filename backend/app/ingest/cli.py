@@ -6,7 +6,7 @@ from pathlib import Path
 from app.config import settings
 from app.ingest import actions as actions_mod
 from app.ingest import amfi, bhavcopy, bhavcopy_dir, indices as indices_mod, universe
-from app.ingest import yfinance_src, zip_archive
+from app.ingest import yfinance_src, zip_archive, financial_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,30 @@ def _run_update(args: argparse.Namespace) -> None:
         print(f"update errors: {result['errors']}")
 
 
+def _run_fin_coverage(args: argparse.Namespace) -> None:
+    from app.ingest.financial_coverage import (
+        compute_coverage_report, export_csv, export_json, print_console_summary
+    )
+
+    report = compute_coverage_report(min_quarters_per_year=args.min_quarters)
+    print_console_summary(report)
+
+    if args.output:
+        path = Path(args.output)
+        export_csv(report, path.with_suffix('.csv'))
+        export_json(report, path.with_suffix('.json'))
+        print(f"\nExported: {path.with_suffix('.csv')} + {path.with_suffix('.json')}")
+
+    if args.no_fin_csv:
+        from app.ingest.financial_coverage import get_operating_without_financials_csv
+        csv_content = get_operating_without_financials_csv()
+        if args.no_fin_csv == "-":
+            print(csv_content)
+        else:
+            Path(args.no_fin_csv).write_text(csv_content)
+            print(f"Operating companies without financials CSV: {args.no_fin_csv}")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -352,6 +376,12 @@ def main() -> None:
     p.add_argument("--days", type=int, default=7, help="look-back window in days")
     p.add_argument("--rate", type=float, default=0.5, help="min seconds between requests")
     p.set_defaults(func=_run_update)
+
+    p = sub.add_parser("fin-coverage", help="coverage report: financials vs OHLCV for mainboard operating companies")
+    p.add_argument("--output", type=str, default="", help="output path (writes .csv + .json)")
+    p.add_argument("--min-quarters", type=int, default=4, help="min quarters/year to meet threshold")
+    p.add_argument("--no-fin-csv", type=str, default="", help="export CSV of operating companies without financials (use '-' for stdout)")
+    p.set_defaults(func=_run_fin_coverage)
 
     args = parser.parse_args()
     args.func(args)

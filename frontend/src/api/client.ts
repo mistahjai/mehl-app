@@ -492,10 +492,26 @@ export function goalPlan(body: {
 
 export type TickerType = "stock" | "etf" | "mf" | "index";
 
+export type TickerCategory =
+  | "equity"
+  | "sme"
+  | "etf"
+  | "mf"
+  | "mf-equity"
+  | "mf-debt"
+  | "mf-hybrid"
+  | "mf-index"
+  | "reit"
+  | "invit"
+  | "delisted"
+  | "index"
+  | "other";
+
 export interface Ticker {
   symbol: string;
   name: string | null;
   type: TickerType;
+  category: TickerCategory;
   is_active: boolean;
   date_first_entry: string | null;
   date_last_entry: string | null;
@@ -511,9 +527,17 @@ export interface OverviewResponse {
   metrics: Record<string, number | null>;
 }
 
-export function searchTickers(q: string, types?: string | null, limit = 12): Promise<Ticker[]> {
+export function searchTickers(
+  q: string,
+  types?: string | null,
+  limit = 12,
+  excludeSme = true,
+  excludeDelisted = true,
+): Promise<Ticker[]> {
   const params = new URLSearchParams({ q, limit: String(limit) });
   if (types) params.set("types", types);
+  if (!excludeSme) params.set("exclude_sme", "false");
+  if (!excludeDelisted) params.set("exclude_delisted", "false");
   return get<Ticker[]>(`/api/market/tickers?${params.toString()}`);
 }
 

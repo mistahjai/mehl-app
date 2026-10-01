@@ -105,9 +105,49 @@ async def get_ohlcv(
     return df.select("symbol", "ts", "open", "high", "low", "close", "volume").to_dicts()
 
 
+def compute_category(series: str | None, instrument_type: str | None, is_active: bool, name: str | None) -> str:
+    """Compute UI category tag from security attributes."""
+    if not is_active:
+        return "delisted"
+    if series in ("SM", "ST", "SZ"):
+        return "sme"
+    if instrument_type == "etf":
+        return "etf"
+    if instrument_type == "mf":
+        if not name:
+            return "mf"
+        n = name.upper()
+        if "LIQUID" in n or "OVERNIGHT" in n or "ULTRA SHORT" in n or "MONEY MARKET" in n:
+            return "mf-debt"
+        if "ELSS" in n or "TAX SAVER" in n or "EQUITY" in n or "LARGE CAP" in n or "MID CAP" in n or "SMALL CAP" in n or "FLEXI CAP" in n or "MULTI CAP" in n or "FOCUSED" in n or "VALUE" in n or "SECTORAL" in n or "THEMATIC" in n or "PHARMA" in n or "BANKING" in n or "TECHNOLOGY" in n or "HEALTHCARE" in n or "INFRASTRUCTURE" in n or "CONSUMPTION" in n or "FINANCIAL" in n or "ENERGY" in n:
+            return "mf-equity"
+        if "ARBITRAGE" in n or "BALANCED ADVANTAGE" in n or "DYNAMIC ASSET" in n or "DYNAMIC TERM" in n or "HYBRID" in n or "BALANCED" in n or "MULTI ASSET" in n or "ASSET ALLOCATION" in n:
+            return "mf-hybrid"
+        if "INDEX" in n and ("FUND" in n or "ETF" in n):
+            return "mf-index"
+        if "DEBT" in n or "CORPORATE BOND" in n or "GILT" in n or "CREDIT RISK" in n or "BANKING & PSU" in n or "BANKING AND PSU" in n or "FLOATER" in n or "DURATION" in n or "INCOME" in n:
+            return "mf-debt"
+        return "mf"
+    if series in ("EQ", "BE", "BZ"):
+        if name:
+            n = name.upper()
+            if "REIT" in n:
+                return "reit"
+            if "INVIT" in n or "INFRASTRUCTURE INVESTMENT" in n:
+                return "invit"
+        return "equity"
+    if series == "MF":
+        return "mf"
+    return "other"
+
+
 @router.get("/tickers")
 async def search_tickers(
-    q: str = "", types: str | None = None, limit: int = 20
+    q: str = "",
+    types: str | None = None,
+    limit: int = 20,
+    exclude_sme: bool = True,
+    exclude_delisted: bool = True,
 ) -> list[dict]:
     """Search tradeable tickers (stocks, ETFs, MFs, indices) by symbol or name.
 
@@ -128,22 +168,41 @@ async def search_tickers(
 
         with SessionLocal() as session:
             query = session.query(
-                Security.symbol, Security.name, Security.instrument_type, Security.is_active
+                Security.symbol, Security.name, Security.instrument_type, Security.is_active, Security.series
             )
             if q:
                 like = f"%{q}%"
                 query = query.filter(or_(Security.symbol.ilike(like), Security.name.ilike(like)))
+            
+            # Filter by instrument_type at DB level to avoid 2000-row limit bias
+            if want == {"mf"}:
+                query = query.filter(Security.instrument_type == "mf")
+            elif want == {"etf"}:
+                query = query.filter(Security.instrument_type == "etf")
+            elif want == {"stock"}:
+                query = query.filter(Security.instrument_type == "stock")
+            elif want - {"mf", "etf"} == {"stock"}:
+                query = query.filter(Security.instrument_type.in_(["stock", "mf", "etf"]))
+            
+            # Order by is_active desc (active first), then instrument_type, then symbol for balanced results
+            query = query.order_by(Security.is_active.desc(), Security.instrument_type, Security.symbol)
             rows = query.limit(2000).all()
         sec_types = {"mf", "etf"}
-        for symbol, name, instrument_type, is_active in rows:
+        for symbol, name, instrument_type, is_active, series in rows:
             ttype = instrument_type if instrument_type in sec_types else "stock"
             if ttype not in want:
+                continue
+            category = compute_category(series, instrument_type, bool(is_active), name)
+            if exclude_sme and category == "sme":
+                continue
+            if exclude_delisted and category == "delisted":
                 continue
             results.append(
                 {
                     "symbol": symbol,
                     "name": name,
                     "type": ttype,
+                    "category": category,
                     "is_active": bool(is_active),
                 }
             )
@@ -152,7 +211,7 @@ async def search_tickers(
         for symbol in market_db.list_indices():
             if ql and ql not in symbol.lower():
                 continue
-            results.append({"symbol": symbol, "name": None, "type": "index", "is_active": True})
+            results.append({"symbol": symbol, "name": None, "type": "index", "category": "index", "is_active": True})
 
     coverage = {
         row["symbol"]: (row["date_first_entry"], row["date_last_entry"])

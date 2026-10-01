@@ -17,6 +17,8 @@ export function SymbolSearch({
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [excludeSme, setExcludeSme] = useState(true);
+  const [excludeDelisted, setExcludeDelisted] = useState(true);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -27,7 +29,7 @@ export function SymbolSearch({
       return;
     }
     const timer = setTimeout(() => {
-      searchTickers(q.trim(), types ?? null, 12)
+      searchTickers(q.trim(), types ?? null, 12, excludeSme, excludeDelisted)
         .then((rows) => {
           setResults(rows);
           setOpen(true);
@@ -41,7 +43,7 @@ export function SymbolSearch({
         });
     }, 150);
     return () => clearTimeout(timer);
-  }, [q, types]);
+  }, [q, types, excludeSme, excludeDelisted]);
 
   useEffect(() => {
     const onDocMouseDown = (e: MouseEvent) => {
@@ -57,6 +59,22 @@ export function SymbolSearch({
     setResults([]);
     setOpen(false);
     setError(null);
+  };
+
+  const categoryLabel: Record<string, string> = {
+    equity: "Equity",
+    sme: "SME",
+    etf: "ETF",
+    mf: "MF",
+    "mf-equity": "MF-Equity",
+    "mf-debt": "MF-Debt",
+    "mf-hybrid": "MF-Hybrid",
+    "mf-index": "MF-Index",
+    reit: "REIT",
+    invit: "InvIT",
+    delisted: "Delisted",
+    index: "Index",
+    other: "Other",
   };
 
   return (
@@ -86,6 +104,24 @@ export function SymbolSearch({
           }
         }}
       />
+      <div className="symbol-search-filters">
+        <label className="filter-checkbox">
+          <input
+            type="checkbox"
+            checked={excludeSme}
+            onChange={(e) => setExcludeSme(e.target.checked)}
+          />
+          <span>Exclude SME</span>
+        </label>
+        <label className="filter-checkbox">
+          <input
+            type="checkbox"
+            checked={excludeDelisted}
+            onChange={(e) => setExcludeDelisted(e.target.checked)}
+          />
+          <span>Exclude Delisted</span>
+        </label>
+      </div>
       {open && results.length > 0 && (
         <ul className="symbol-search-results" role="listbox">
           {results.map((t, i) => (
@@ -103,6 +139,7 @@ export function SymbolSearch({
               <span className="tt-symbol">{t.symbol}</span>
               <span className="tt-name">{t.name ?? ""}</span>
               <span className={`tt-type type-${t.type}`}>{t.type}</span>
+              <span className={`tt-category cat-${t.category}`}>{categoryLabel[t.category] ?? t.category}</span>
             </li>
           ))}
         </ul>

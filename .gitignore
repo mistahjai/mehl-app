@@ -34,4 +34,9 @@ uploads/
 .idea/
 .vscode/
 
+# Coverage reports
+backend/coverage_report.csv
+backend/coverage_report.json
+backend/no_financials.csv
+
 MEMORY.md
