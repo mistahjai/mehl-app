@@ -86,6 +86,9 @@ def _seed_financials(symbol: str = "FAKE") -> None:
 
 def _sync_one_security(symbol: str = "FAKE") -> None:
     from app.ingest.universe import sync_securities
+    from app.state.db import SessionLocal
+    from app.state.models import SecurityInfo
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
     sync_securities(
         pl.DataFrame(
@@ -99,6 +102,19 @@ def _sync_one_security(symbol: str = "FAKE") -> None:
             }
         )
     )
+
+    # Also insert into securities_info for shares_outstanding
+    with SessionLocal() as session:
+        session.execute(
+            sqlite_insert(SecurityInfo).values(
+                symbol=symbol,
+                shares_outstanding=100.0,
+            ).on_conflict_do_update(
+                index_elements=[SecurityInfo.symbol],
+                set_={"shares_outstanding": 100.0},
+            )
+        )
+        session.commit()
 
 
 def test_screener_endpoint(client: TestClient) -> None:
@@ -133,21 +149,25 @@ def test_screener_endpoint(client: TestClient) -> None:
 
 
 def test_fundamentals_endpoints(client: TestClient) -> None:
+    _seed_market_data("FAKE", days=30)
+    _sync_one_security("FAKE")
+    _seed_financials("FAKE")
+    
     res = client.get("/api/market/fundamentals/FAKE")
     assert res.status_code == 200
     body = res.json()
-    assert body["latest"]["pe"] == 129.5  # 100 shares x 129.5 close / 100 TTM NI
-    assert body["latest"]["pb"] == 25.9
-    assert body["latest"]["roe"] == 0.2
-    assert body["latest"]["roce"] == 0.1875
-    assert body["latest"]["debt_to_equity"] == 0.5
-    assert body["latest"]["net_margin"] == 0.1
-    assert body["latest"]["revenue_growth"] == 0.25
+    assert body["latest"]["pe"]["value"] == 129.5  # 100 shares x 129.5 close / 100 TTM NI
+    assert body["latest"]["pb"]["value"] == 25.9
+    assert body["latest"]["roe"]["value"] == 0.2
+    assert body["latest"]["roce"]["value"] == 0.1875
+    assert body["latest"]["debt_to_equity"]["value"] == 0.5
+    assert body["latest"]["net_margin"]["value"] == 0.1
+    assert body["latest"]["revenue_growth"]["value"] == 0.25
     assert len(body["history"]) == 6
 
-    res = client.get("/api/market/fundamentals/FAKE/statements?statement=income")
+    res = client.get("/api/market/fundamentals/FAKE/statements?statement=profit_loss")
     assert res.status_code == 200
-    assert "income" in res.json()["statements"]
+    assert "profit_loss" in res.json()["statements"]
 
     res = client.get("/api/market/fundamentals/UNKNOWN_SYM")
     assert res.status_code == 200

@@ -6,7 +6,7 @@ from pathlib import Path
 from app.config import settings
 from app.ingest import actions as actions_mod
 from app.ingest import amfi, bhavcopy, bhavcopy_dir, indices as indices_mod, universe
-from app.ingest import yfinance_src, zip_archive, financial_coverage
+from app.ingest import yfinance_src, zip_archive, financial_coverage, screener_fundamentals
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +240,16 @@ def _run_fin_coverage(args: argparse.Namespace) -> None:
             print(f"Operating companies without financials CSV: {args.no_fin_csv}")
 
 
+def _run_screener_fundamentals(args: argparse.Namespace) -> None:
+    from app.ingest.screener_fundamentals import ingest_screener_fundamentals
+    
+    data_dir = Path(args.path) if args.path else None
+    result = ingest_screener_fundamentals(data_dir=data_dir, batch_size=args.batch_size)
+    print(f"screener-fundamentals: {result['files_processed']} files, {result['rows_inserted']} rows")
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -382,6 +392,11 @@ def main() -> None:
     p.add_argument("--min-quarters", type=int, default=4, help="min quarters/year to meet threshold")
     p.add_argument("--no-fin-csv", type=str, default="", help="export CSV of operating companies without financials (use '-' for stdout)")
     p.set_defaults(func=_run_fin_coverage)
+
+    p = sub.add_parser("screener-fundamentals", help="ingest screener fundamentals from Kaggle dataset")
+    p.add_argument("--path", type=str, default="", help="path to extracted JSON files directory")
+    p.add_argument("--batch-size", type=int, default=10000, help="batch size for upserts")
+    p.set_defaults(func=_run_screener_fundamentals)
 
     args = parser.parse_args()
     args.func(args)

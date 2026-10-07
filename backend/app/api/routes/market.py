@@ -1,11 +1,13 @@
 from dataclasses import asdict
 import time
 from datetime import date, timedelta
+from typing import Optional
 
 import polars as pl
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import or_
 
+from app.config import settings
 from app.engine import adjust
 from app.engine import allocation, backtest, db as market_db
 from app.engine import fundamentals, screener
@@ -60,7 +62,7 @@ def _screener_frame() -> pl.DataFrame:
     snapshot = market_db.fetch_latest_snapshot().select("symbol", "close", "last_ts")
     shares = _securities_frame().select("symbol", "shares_outstanding")
     metrics = fundamentals.compute_universe_metrics(
-        fundamentals.pivot_financials(fundamentals.load_financials()),
+        fundamentals.pivot_financials_unified(fundamentals.load_financials_unified()),
         prices=snapshot,
         shares_override=shares,
     )
@@ -317,14 +319,18 @@ async def get_overview(symbol: str) -> dict:
     if ttype in ("stock", "etf"):
         snapshot = market_db.fetch_latest_snapshot().select("symbol", "close", "last_ts")
         shares = _securities_frame().select("symbol", "shares_outstanding")
-        fin_piv = fundamentals.pivot_financials(fundamentals.load_financials([symbol]))
+        fin_piv = fundamentals.pivot_financials_unified(fundamentals.load_financials_unified([symbol]))
         metrics = fundamentals.compute_universe_metrics(
             fin_piv, prices=snapshot, shares_override=shares
         )
         if not metrics.is_empty():
             row = metrics.to_dicts()[0]
             out["metrics"] = {
-                key: row.get(key)
+                key: {
+                    "value": row.get(key),
+                    "source": "screener" if key in ("revenue", "net_income", "ebitda", "free_cash_flow", "equity", "total_assets", "total_debt") else "yfinance",
+                    "consolidation": settings.financials_consolidation,
+                }
                 for key in (
                     "market_cap",
                     "pe",
@@ -471,7 +477,10 @@ async def screener_endpoint(req: ScreenerRequest) -> dict:
 
 
 @router.get("/fundamentals/{symbol}")
-async def get_fundamentals(symbol: str) -> dict:
+async def get_fundamentals(
+    symbol: str,
+    consolidation: str = Query(default="consolidated", pattern="^(consolidated|standalone)$"),
+) -> dict:
     symbol = symbol.upper()
     snapshot = market_db.fetch_latest_snapshot().select("symbol", "close", "last_ts")
     prices = (
@@ -479,17 +488,32 @@ async def get_fundamentals(symbol: str) -> dict:
         .select(pl.col("ts"), pl.col("close"))
         .sort("ts")
     )
-    fin_piv = fundamentals.pivot_financials(fundamentals.load_financials([symbol]))
+    fin_piv = fundamentals.pivot_financials_unified(fundamentals.load_financials_unified([symbol], consolidation=consolidation))
     latest = fundamentals.compute_universe_metrics(fin_piv, prices=snapshot)
     latest_row = latest.to_dicts()[0] if not latest.is_empty() else None
     history = fundamentals.compute_symbol_history(fin_piv, prices)
-    return {"symbol": symbol, "latest": latest_row, "history": history}
+    
+    # Add source/consolidation info to latest metrics
+    if latest_row:
+        for key in latest_row:
+            if latest_row[key] is not None:
+                latest_row[key] = {
+                    "value": latest_row[key],
+                    "source": "screener" if key in ("revenue", "net_income", "ebitda", "free_cash_flow", "equity", "total_assets", "total_debt", "shares") else "yfinance",
+                    "consolidation": consolidation,
+                }
+    
+    return {"symbol": symbol, "latest": latest_row, "history": history, "consolidation": consolidation}
 
 
 @router.get("/fundamentals/{symbol}/statements")
-async def get_statements(symbol: str, statement: str | None = None) -> dict:
+async def get_statements(
+    symbol: str,
+    statement: str | None = None,
+    consolidation: str = Query(default="consolidated", pattern="^(consolidated|standalone)$"),
+) -> dict:
     symbol = symbol.upper()
-    df = fundamentals.load_financials([symbol])
+    df = fundamentals.load_financials_unified([symbol], consolidation=consolidation)
     if statement is not None:
         df = df.filter(pl.col("statement") == statement)
     if df.is_empty():
@@ -499,11 +523,15 @@ async def get_statements(symbol: str, statement: str | None = None) -> dict:
         stmt = stmt_key[0] if isinstance(stmt_key, tuple) else stmt_key
         rows = (
             group.sort("period_end")
-            .select("period_end", "period_type", "line_item", "value")
+            .select("period_end", "period_type", "line_item", "value", "source", "consolidation")
             .to_dicts()
         )
+        # Convert value to Cr for display
+        for row in rows:
+            if row["value"] is not None:
+                row["value"] = row["value"] / 10_000_000  # Convert to Cr
         out[str(stmt)] = rows
-    return {"symbol": symbol, "statements": out}
+    return {"symbol": symbol, "statements": out, "consolidation": consolidation}
 
 
 @router.post("/backtest")

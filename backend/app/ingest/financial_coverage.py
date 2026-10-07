@@ -98,6 +98,8 @@ def get_financial_coverage(symbols: list[str]) -> pl.DataFrame:
             "symbol": pl.String,
             "period_type": pl.String,
             "statement": pl.String,
+            "source": pl.String,
+            "consolidation": pl.String,
             "period_count": pl.Int64,
             "min_period_end": pl.Date,
             "max_period_end": pl.Date,
@@ -108,11 +110,15 @@ def get_financial_coverage(symbols: list[str]) -> pl.DataFrame:
     con = sqlite3.connect(path)
     try:
         placeholders = ",".join("?" * len(symbols))
-        query = f"""
+        
+        # Query yfinance financials
+        query_yf = f"""
             SELECT 
                 symbol,
                 period_type,
                 statement,
+                'yfinance' as source,
+                'consolidated' as consolidation,
                 COUNT(DISTINCT period_end) as period_count,
                 MIN(period_end) as min_period_end,
                 MAX(period_end) as max_period_end
@@ -121,21 +127,50 @@ def get_financial_coverage(symbols: list[str]) -> pl.DataFrame:
             GROUP BY symbol, period_type, statement
         """
         cursor = con.cursor()
-        cursor.execute(query, symbols)
-        rows = cursor.fetchall()
-        if not rows:
+        cursor.execute(query_yf, symbols)
+        rows_yf = cursor.fetchall()
+        
+        # Query screener financials with normalized statement names
+        query_scr = f"""
+            SELECT 
+                symbol,
+                period_type,
+                CASE 
+                    WHEN statement = 'profit_loss' THEN 'income'
+                    WHEN statement = 'balance_sheet' THEN 'balance'
+                    WHEN statement = 'cash_flows' THEN 'cashflow'
+                    WHEN statement = 'ratios' THEN 'ratios'
+                    WHEN statement = 'share_holding' THEN 'share_holding'
+                    ELSE statement
+                END as statement,
+                'screener' as source,
+                consolidation,
+                COUNT(DISTINCT period_end) as period_count,
+                MIN(period_end) as min_period_end,
+                MAX(period_end) as max_period_end
+            FROM financials_screener
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol, period_type, statement, consolidation
+        """
+        cursor.execute(query_scr, symbols)
+        rows_scr = cursor.fetchall()
+        
+        all_rows = rows_yf + rows_scr
+        if not all_rows:
             return pl.DataFrame(schema={
                 "symbol": pl.String,
                 "period_type": pl.String,
                 "statement": pl.String,
+                "source": pl.String,
+                "consolidation": pl.String,
                 "period_count": pl.Int64,
                 "min_period_end": pl.Date,
                 "max_period_end": pl.Date,
                 "years_covered": pl.Float64
             })
-        df = pl.DataFrame(rows, schema=[
-            "symbol", "period_type", "statement", "period_count",
-            "min_period_end", "max_period_end"
+        df = pl.DataFrame(all_rows, schema=[
+            "symbol", "period_type", "statement", "source", "consolidation",
+            "period_count", "min_period_end", "max_period_end"
         ], orient="row")
         df = df.with_columns(
             pl.col("min_period_end").str.to_date("%Y-%m-%d"),
@@ -194,47 +229,62 @@ def compute_coverage_report(min_quarters_per_year: int = 4) -> dict:
 
     stmt_periods = ["income", "balance", "cashflow"]
     period_types = ["annual", "quarterly"]
+    sources = ["screener", "yfinance"]
 
+    # Pivot by source as well to get per-source coverage
     fin_pivot = fin_cov.pivot(
         values=["period_count", "min_period_end", "max_period_end", "years_covered"],
         index="symbol",
-        on=["period_type", "statement"],
+        on=["period_type", "statement", "source"],
         aggregate_function="first"
     )
 
-    # Pivot creates columns like: period_count_{"annual","income"}
+    # Pivot creates columns like: period_count_{"annual","income","screener"}
     # Rename them to simpler names
     rename_map = {}
     for pt in period_types:
         for stmt in stmt_periods:
-            old_pc = f'period_count_{{\"{pt}\",\"{stmt}\"}}'
-            old_min = f'min_period_end_{{\"{pt}\",\"{stmt}\"}}'
-            old_max = f'max_period_end_{{\"{pt}\",\"{stmt}\"}}'
-            old_yrs = f'years_covered_{{\"{pt}\",\"{stmt}\"}}'
-            new_pc = f"period_count_{pt}_{stmt}"
-            new_min = f"min_period_end_{pt}_{stmt}"
-            new_max = f"max_period_end_{pt}_{stmt}"
-            new_yrs = f"years_covered_{pt}_{stmt}"
-            if old_pc in fin_pivot.columns:
-                rename_map[old_pc] = new_pc
-            if old_min in fin_pivot.columns:
-                rename_map[old_min] = new_min
-            if old_max in fin_pivot.columns:
-                rename_map[old_max] = new_max
-            if old_yrs in fin_pivot.columns:
-                rename_map[old_yrs] = new_yrs
+            for src in sources:
+                old_pc = f'period_count_{{\"{pt}\",\"{stmt}\",\"{src}\"}}'
+                old_min = f'min_period_end_{{\"{pt}\",\"{stmt}\",\"{src}\"}}'
+                old_max = f'max_period_end_{{\"{pt}\",\"{stmt}\",\"{src}\"}}'
+                old_yrs = f'years_covered_{{\"{pt}\",\"{stmt}\",\"{src}\"}}'
+                new_pc = f"period_count_{pt}_{stmt}_{src}"
+                new_min = f"min_period_end_{pt}_{stmt}_{src}"
+                new_max = f"max_period_end_{pt}_{stmt}_{src}"
+                new_yrs = f"years_covered_{pt}_{stmt}_{src}"
+                if old_pc in fin_pivot.columns:
+                    rename_map[old_pc] = new_pc
+                if old_min in fin_pivot.columns:
+                    rename_map[old_min] = new_min
+                if old_max in fin_pivot.columns:
+                    rename_map[old_max] = new_max
+                if old_yrs in fin_pivot.columns:
+                    rename_map[old_yrs] = new_yrs
     
     if rename_map:
         fin_pivot = fin_pivot.rename(rename_map)
 
-    def get_col(base: str, pt: str, stmt: str) -> str:
+    def get_col(base: str, pt: str, stmt: str, src: str = "") -> str:
+        if src:
+            return f"{base}_{pt}_{stmt}_{src}"
         return f"{base}_{pt}_{stmt}"
 
     for pt in period_types:
         for stmt in stmt_periods:
-            pc_col = get_col("period_count", pt, stmt)
-            if pc_col not in fin_pivot.columns:
-                fin_pivot = fin_pivot.with_columns(pl.lit(0).alias(pc_col))
+            for src in sources:
+                pc_col = get_col("period_count", pt, stmt, src)
+                if pc_col not in fin_pivot.columns:
+                    fin_pivot = fin_pivot.with_columns(pl.lit(0).alias(pc_col))
+
+    # Aggregate across sources (prefer screener, fallback to yfinance)
+    for pt in period_types:
+        for stmt in stmt_periods:
+            screener_col = get_col("period_count", pt, stmt, "screener")
+            yfinance_col = get_col("period_count", pt, stmt, "yfinance")
+            fin_pivot = fin_pivot.with_columns(
+                pl.coalesce([pl.col(screener_col), pl.col(yfinance_col)]).alias(get_col("period_count", pt, stmt)),
+            )
 
     annual_cols = [get_col("period_count", "annual", s) for s in stmt_periods]
     quarterly_cols = [get_col("period_count", "quarterly", s) for s in stmt_periods]
@@ -251,10 +301,16 @@ def compute_coverage_report(min_quarters_per_year: int = 4) -> dict:
         )
 
     fin_pivot = fin_pivot.with_columns(
-        pl.col(get_col("max_period_end", "annual", "income")).alias("annual_max_date"),
-        pl.col(get_col("min_period_end", "annual", "income")).alias("annual_min_date"),
-        pl.col(get_col("max_period_end", "quarterly", "income")).alias("quarterly_max_date"),
-        pl.col(get_col("min_period_end", "quarterly", "income")).alias("quarterly_min_date"),
+        pl.col(get_col("max_period_end", "annual", "income", "screener")).alias("annual_max_date"),
+        pl.col(get_col("min_period_end", "annual", "income", "screener")).alias("annual_min_date"),
+        pl.when(pl.col(get_col("max_period_end", "quarterly", "income", "screener")).is_not_null())
+        .then(pl.col(get_col("max_period_end", "quarterly", "income", "screener")))
+        .otherwise(pl.col(get_col("max_period_end", "quarterly", "income", "yfinance")))
+        .alias("quarterly_max_date"),
+        pl.when(pl.col(get_col("min_period_end", "quarterly", "income", "screener")).is_not_null())
+        .then(pl.col(get_col("min_period_end", "quarterly", "income", "screener")))
+        .otherwise(pl.col(get_col("min_period_end", "quarterly", "income", "yfinance")))
+        .alias("quarterly_min_date"),
     )
 
     fin_pivot = fin_pivot.with_columns(

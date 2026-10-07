@@ -149,3 +149,20 @@ class FinancialStatementRow(Base):
     statement: Mapped[str] = mapped_column(String)
     line_item: Mapped[str] = mapped_column(String)
     value: Mapped[float | None] = mapped_column(Float, default=None)
+
+
+class FinancialStatementRowScreener(Base):
+    __tablename__ = "financials_screener"
+    __table_args__ = (
+        UniqueConstraint("symbol", "period_type", "period_end", "statement", "line_item", "consolidation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    period_type: Mapped[str] = mapped_column(String)  # 'annual' | 'quarterly' | 'ttm'
+    period_end: Mapped[date] = mapped_column(Date)
+    statement: Mapped[str] = mapped_column(String)  # 'profit_loss' | 'balance_sheet' | 'cash_flows' | 'ratios' | 'share_holding'
+    line_item: Mapped[str] = mapped_column(String)  # original screener names
+    value: Mapped[float | None] = mapped_column(Float, default=None)  # stored in raw INR
+    consolidation: Mapped[str] = mapped_column(String)  # 'consolidated' | 'standalone'
+    source: Mapped[str] = mapped_column(String, default="screener")

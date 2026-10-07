@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Path to the APScheduler job store (SQLite). Survives container restarts.
     data_update_jobstore_path: Path = Path(__file__).resolve().parent.parent / "data" / "scheduler.sqlite"
 
+    # Financials data source configuration
+    financials_primary_source: str = "screener"  # "screener" | "yfinance"
+    financials_consolidation: str = "consolidated"  # "consolidated" | "standalone"
+    financials_fallback_source: str = "yfinance"  # "yfinance" | "none"
+
     @property
     def effective_database_url(self) -> str:
         return self.database_url or f"sqlite:///{self.data_dir / 'mehl.db'}"

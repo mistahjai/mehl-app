@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 from datetime import date
+from pathlib import Path
 
 import polars as pl
 
@@ -30,6 +31,50 @@ STOCK_ITEMS = {
 }
 
 ALL_ITEMS = {**FLOW_ITEMS, **STOCK_ITEMS}
+
+# Screener canonical line items (source of truth for unified view)
+SCREENER_FLOW_ITEMS = {
+    "revenue": ["Sales +", "Revenue +", "TotalRevenue", "OperatingRevenue", "Revenues"],
+    "net_income": ["Net Profit +", "NetIncome", "NetIncomeCommonStockholders"],
+    "ebit": ["Operating Profit", "EBIT", "OperatingIncome"],
+    "ebitda": ["Operating Profit", "NormalizedEBITDA", "EBITDA"],
+    "free_cash_flow": ["Free Cash Flow", "FreeCashFlow"],
+}
+
+SCREENER_STOCK_ITEMS = {
+    "equity": ["Equity Capital", "CommonStockEquity", "StockholdersEquity"],
+    "total_assets": ["Total Assets", "TotalAssets"],
+    "current_liabilities": ["Other Liabilities +", "CurrentLiabilities", "TotalLiabilitiesNetMinorityInterest"],
+    "total_debt": ["Borrowings +", "TotalDebt"],
+    "shares": ["OrdinarySharesNumber", "ShareIssued"],
+}
+
+SCREENER_ALL_ITEMS = {**SCREENER_FLOW_ITEMS, **SCREENER_STOCK_ITEMS}
+
+# yfinance -> screener canonical mapping (for UI display when falling back)
+YFINANCE_TO_SCREENER = {
+    "TotalRevenue": "Sales +",
+    "OperatingRevenue": "Sales +",
+    "Revenues": "Sales +",
+    "NetIncome": "Net Profit +",
+    "NetIncomeCommonStockholders": "Net Profit +",
+    "EBIT": "Operating Profit",
+    "OperatingIncome": "Operating Profit",
+    "NormalizedEBITDA": "Operating Profit",
+    "EBITDA": "Operating Profit",
+    "FreeCashFlow": "Free Cash Flow",
+    "CommonStockEquity": "Equity Capital",
+    "StockholdersEquity": "Equity Capital",
+    "TotalAssets": "Total Assets",
+    "CurrentLiabilities": "Other Liabilities +",
+    "TotalLiabilitiesNetMinorityInterest": "Total Liabilities",
+    "TotalDebt": "Borrowings +",
+    "OrdinarySharesNumber": "OrdinarySharesNumber",
+    "ShareIssued": "ShareIssued",
+    "OperatingCashFlow": "Cash from Operating Activity +",
+    "InvestingCashFlow": "Cash from Investing Activity +",
+    "FinancingCashFlow": "Cash from Financing Activity +",
+}
 
 _EMPTY_FIN_SCHEMA = {
     "symbol": pl.String,
@@ -302,3 +347,193 @@ def compute_symbol_history(
         "operating_margin",
     )
     return out.to_dicts()
+
+
+def _load_screener_financials(symbols: list[str] | None = None) -> pl.DataFrame:
+    """Load screener financials from financials_screener table."""
+    path = settings.data_dir / "mehl.db"
+    if not path.exists():
+        return pl.DataFrame(schema=_EMPTY_FIN_SCHEMA)
+    con = sqlite3.connect(path)
+    try:
+        query = (
+            "SELECT symbol, period_type, period_end, statement, line_item, value, "
+            "consolidation, source FROM financials_screener"
+        )
+        params: list[object] = []
+        if symbols:
+            query += f" WHERE symbol IN ({','.join('?' * len(symbols))})"
+            params = list(symbols)
+        rows = con.execute(query, params).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return pl.DataFrame(schema={
+            **_EMPTY_FIN_SCHEMA,
+            "consolidation": pl.String,
+            "source": pl.String,
+        })
+    return (
+        pl.DataFrame(rows, schema={
+            "symbol": pl.String,
+            "period_type": pl.String,
+            "period_end": pl.String,
+            "statement": pl.String,
+            "line_item": pl.String,
+            "value": pl.Float64,
+            "consolidation": pl.String,
+            "source": pl.String,
+        }, orient="row")
+        .with_columns(pl.col("period_end").str.to_date("%Y-%m-%d"))
+    )
+
+
+def _load_yfinance_financials(symbols: list[str] | None = None) -> pl.DataFrame:
+    """Load yfinance financials with screener canonical line items."""
+    df = load_financials(symbols)
+    if df.is_empty():
+        return pl.DataFrame(schema={
+            **_EMPTY_FIN_SCHEMA,
+            "consolidation": pl.String,
+            "source": pl.String,
+        })
+    # Map yfinance line items to screener canonical names
+    df = df.with_columns(
+        pl.col("line_item").replace(YFINANCE_TO_SCREENER, default=pl.col("line_item")).alias("line_item"),
+        pl.lit("yfinance").alias("source"),
+        pl.lit("consolidated").alias("consolidation"),
+    )
+    # Ensure same column order as screener
+    return df.select([
+        "symbol", "period_type", "period_end", "statement", 
+        "line_item", "value", "consolidation", "source"
+    ])
+
+
+def load_financials_unified(
+    symbols: list[str] | None = None,
+    consolidation: str = "consolidated",
+) -> pl.DataFrame:
+    """Load financials with priority: screener consolidated -> screener standalone -> yfinance.
+    
+    Returns unified frame with columns:
+    symbol, period_type, period_end, statement, line_item, value, source, consolidation
+    """
+    # 1. Load screener data (both consolidated and standalone)
+    screener_df = _load_screener_financials(symbols)
+    
+    if not screener_df.is_empty():
+        # Filter by consolidation preference
+        if consolidation == "consolidated":
+            # Prioritize consolidated, fill gaps with standalone
+            consolidated_df = screener_df.filter(pl.col("consolidation") == "consolidated")
+            standalone_df = screener_df.filter(pl.col("consolidation") == "standalone")
+            
+            # Find missing keys in consolidated that exist in standalone
+            if not consolidated_df.is_empty() and not standalone_df.is_empty():
+                keys = ["symbol", "period_type", "period_end", "statement", "line_item"]
+                consolidated_keys = consolidated_df.select(keys).unique()
+                missing = standalone_df.join(consolidated_keys, on=keys, how="anti")
+                screener_df = pl.concat([consolidated_df, missing])
+            else:
+                screener_df = consolidated_df
+        elif consolidation == "standalone":
+            screener_df = screener_df.filter(pl.col("consolidation") == "standalone")
+    else:
+        screener_df = pl.DataFrame(schema={
+            **_EMPTY_FIN_SCHEMA,
+            "consolidation": pl.String,
+            "source": pl.String,
+        })
+    
+    # 2. Load yfinance as fallback
+    yfinance_df = _load_yfinance_financials(symbols)
+    
+    # 3. Merge: screener first, then yfinance for missing keys
+    if not screener_df.is_empty() and not yfinance_df.is_empty():
+        keys = ["symbol", "period_type", "period_end", "statement", "line_item"]
+        screener_keys = screener_df.select(keys).unique()
+        yfinance_missing = yfinance_df.join(screener_keys, on=keys, how="anti")
+        unified = pl.concat([screener_df, yfinance_missing])
+    elif not screener_df.is_empty():
+        unified = screener_df
+    elif not yfinance_df.is_empty():
+        unified = yfinance_df
+    else:
+        unified = pl.DataFrame(schema={
+            **_EMPTY_FIN_SCHEMA,
+            "consolidation": pl.String,
+            "source": pl.String,
+        })
+    
+    # Normalize statement names: yfinance uses 'income'/'balance'/'cashflow', screener uses 'profit_loss'/'balance_sheet'/'cash_flows'
+    stmt_map = {
+        "income": "profit_loss",
+        "balance": "balance_sheet",
+        "cashflow": "cash_flows",
+    }
+    unified = unified.with_columns(
+        pl.col("statement").replace(stmt_map, default=pl.col("statement")).alias("statement")
+    )
+    
+    return unified.select(list(_EMPTY_FIN_SCHEMA.keys()) + ["source", "consolidation"])
+
+
+def pivot_financials_unified(df: pl.DataFrame) -> pl.DataFrame:
+    """Pivot unified financials using screener canonical line items."""
+    if df.is_empty():
+        return pl.DataFrame()
+    
+    # Use screener canonical items for pivot
+    all_items = {**SCREENER_FLOW_ITEMS, **SCREENER_STOCK_ITEMS}
+    
+    piv = df.pivot(
+        values="value",
+        index=["symbol", "period_type", "period_end"],
+        on="line_item",
+        aggregate_function="first",
+    )
+    
+    # Add canonical columns using screener items
+    exprs: list[pl.Expr] = []
+    for canonical, candidates in SCREENER_ALL_ITEMS.items():
+        existing = [pl.col(c) for c in candidates if c in piv.columns]
+        if existing:
+            exprs.append(pl.coalesce(existing).alias(canonical))
+        else:
+            exprs.append(pl.lit(None, dtype=pl.Float64).alias(canonical))
+    
+    # Also add yfinance-specific items that might be in the data
+    for canonical, candidates in ALL_ITEMS.items():
+        if canonical not in SCREENER_ALL_ITEMS:
+            existing = [pl.col(c) for c in candidates if c in piv.columns]
+            if existing:
+                exprs.append(pl.coalesce(existing).alias(canonical))
+            else:
+                exprs.append(pl.lit(None, dtype=pl.Float64).alias(canonical))
+    
+    piv = piv.with_columns(exprs)
+    
+    # Deduplicate annual rows by fiscal year (year of period_end)
+    # Keep the row with the most non-null canonical values
+    annual_mask = pl.col("period_type") == "annual"
+    non_annual = piv.filter(~annual_mask)
+    annual = piv.filter(annual_mask)
+    
+    if not annual.is_empty():
+        # Add fiscal year column
+        annual = annual.with_columns(
+            pl.col("period_end").dt.year().alias("fiscal_year")
+        )
+        # Count non-null canonical columns per row
+        canonical_cols = [c for c in SCREENER_ALL_ITEMS.keys() if c in annual.columns]
+        if canonical_cols:
+            annual = annual.with_columns(
+                pl.sum_horizontal([pl.col(c).is_not_null().cast(pl.Int32) for c in canonical_cols]).alias("_non_null_count")
+            )
+            # Keep row with max non-null count per fiscal_year per symbol
+            annual = annual.sort(["symbol", "fiscal_year", "_non_null_count"], descending=[False, False, True])
+            annual = annual.unique(subset=["symbol", "fiscal_year"], keep="first")
+            annual = annual.drop(["fiscal_year", "_non_null_count"])
+    
+    return pl.concat([annual, non_annual]).sort(["symbol", "period_type", "period_end"])
